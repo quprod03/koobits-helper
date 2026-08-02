@@ -3,6 +3,7 @@ from PIL import Image
 import pytesseract
 from sympy import sympify
 
+# --- Explanation helpers ---
 def explain_addition(num1, num2):
     tens1, ones1 = divmod(num1, 10)
     tens2, ones2 = divmod(num2, 10)
@@ -34,6 +35,7 @@ def explain_subtraction(num1, num2):
     steps.append(f"Final Answer: {total}")
     return steps
 
+# --- Streamlit UI ---
 st.title("Koobits Screenshot Helper")
 
 uploaded_file = st.file_uploader("Upload Koobits Screenshot", type=["png","jpg","jpeg"])
@@ -43,27 +45,48 @@ if uploaded_file:
     text = pytesseract.image_to_string(img).strip()
     st.write("OCR Detected:", text)
 
+    question = None
+    student_answer = None
+
+    # --- Flexible parsing ---
     if "=" in text:
-        question, student_answer = text.split("=")
-        question = question.strip()
-        student_answer = student_answer.strip()
+        parts = text.split("=")
+        question = parts[0].strip()
+        student_answer = parts[1].strip()
+    elif "Answer:" in text:
+        parts = text.split("Answer:")
+        question = parts[0].strip()
+        student_answer = parts[1].strip()
+    else:
+        question = text.strip()
+        student_answer = None
+        st.warning("OCR did not detect an answer. Please type it below.")
+
+    # --- Manual input fallback ---
+    if student_answer is None:
+        student_answer = st.text_input("Enter your answer manually:")
+
+    # --- Answer checking ---
+    if question:
         try:
             correct_answer = sympify(question).evalf()
-            if float(student_answer) == float(correct_answer):
-                st.success("✅ Correct!")
-            else:
-                st.error("❌ Wrong")
-                if "+" in question:
-                    num1, num2 = map(int, question.split("+"))
-                    steps = explain_addition(num1, num2)
-                elif "-" in question:
-                    num1, num2 = map(int, question.split("-"))
-                    steps = explain_subtraction(num1, num2)
+            if student_answer:
+                if float(student_answer) == float(correct_answer):
+                    st.success("✅ Correct!")
                 else:
-                    steps = [f"Correct answer is {correct_answer}, your answer was {student_answer}."]
-                for step in steps:
-                    st.write(step)
+                    st.error("❌ Wrong")
+                    # Explanation logic
+                    if "+" in question:
+                        num1, num2 = map(int, question.split("+"))
+                        steps = explain_addition(num1, num2)
+                    elif "-" in question:
+                        num1, num2 = map(int, question.split("-"))
+                        steps = explain_subtraction(num1, num2)
+                    else:
+                        steps = [f"Correct answer is {correct_answer}, your answer was {student_answer}."]
+                    for step in steps:
+                        st.write(step)
+            else:
+                st.info(f"OCR detected only the question: {question}. Correct answer is {correct_answer}.")
         except Exception as e:
-            st.warning(f"Error: {e}")
-    else:
-        st.warning("Could not detect question and answer format")
+            st.warning(f"Error while solving: {e}")
