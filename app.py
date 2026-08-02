@@ -1,12 +1,75 @@
+# app.py
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageFilter, ImageOps
 import pytesseract
+import numpy as np
+import cv2
 import re
 from fractions import Fraction
 from sympy import sympify
 
 # -------------------------
-# Helpers
+# Utilities
+# -------------------------
+def pil_to_cv(img_pil):
+    return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+
+def cv_to_pil(img_cv):
+    return Image.fromarray(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB))
+
+def preprocess_variants(pil_img):
+    """Return list of (name, PIL image) variants for OCR."""
+    variants = []
+    # original
+    variants.append(("orig", pil_img.copy()))
+    # grayscale
+    g = ImageOps.grayscale(pil_img)
+    variants.append(("gray", g))
+    # resized (improve small text)
+    w, h = pil_img.size
+    scale = 2 if max(w, h) < 1200 else 1
+    if scale != 1:
+        variants.append(("resized", pil_img.resize((w*scale, h*scale), Image.LANCZOS)))
+    # sharpen
+    variants.append(("sharpen", pil_img.filter(ImageFilter.SHARPEN)))
+    # adaptive threshold via OpenCV
+    cv = pil_to_cv(pil_img.convert("L"))
+    cv = cv2.medianBlur(cv, 3)
+    th = cv2.adaptiveThreshold(cv, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                               cv2.THRESH_BINARY, 31, 10)
+    variants.append(("th_adaptive", cv_to_pil(cv2.cvtColor(th, cv2.COLOR_GRAY2BGR))))
+    # Otsu
+    _, otsu = cv2.threshold(cv, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    variants.append(("th_otsu", cv_to_pil(cv2.cvtColor(otsu, cv2.COLOR_GRAY2BGR))))
+    return variants
+
+def ocr_with_config(pil_img, config):
+    """Run pytesseract and return raw text and word confidences list."""
+    try:
+        data = pytesseract.image_to_data(pil_img, output_type=pytesseract.Output.DICT, config=config)
+        text = " ".join([w for w in data['text'] if w.strip()])
+        # compute average confidence (ignore -1)
+        confs = [int(c) for c in data['conf'] if c.strip() and int(float(c)) >= 0]
+        avg_conf = float(np.mean(confs)) if confs else 0.0
+        return text.strip(), avg_conf, data
+    except Exception as e:
+        return "", 0.0, None
+
+def aggregate_ocr_results(results):
+    """
+    results: list of dicts {variant, config, text, conf}
+    Strategy: choose the text with highest conf; also keep top N candidates.
+    """
+    if not results:
+        return "", 0.0, results
+    # sort by conf then by text length (prefer longer meaningful text)
+    sorted_r = sorted(results, key=lambda r: (r['conf'], len(r['text'])), reverse=True)
+    best = sorted_r[0]
+    # build combined candidate by majority token voting (optional)
+    return best['text'], best['conf'], sorted_r
+
+# -------------------------
+# Parsing and evaluation
 # -------------------------
 def extract_numbers(text):
     return [int(n) for n in re.findall(r'\d+', text)]
@@ -14,289 +77,226 @@ def extract_numbers(text):
 def extract_fractions(text):
     return re.findall(r'\d+\s*/\s*\d+', text)
 
-def parse_fraction(frac_str):
-    nums = re.findall(r'\d+', frac_str)
-    return Fraction(int(nums[0]), int(nums[1]))
+def parse_question_answer(candidate_text, raw_text_lines):
+    """
+    Heuristics:
+    - If 'Answer:' present -> split
+    - If '=' present -> split
+    - If 'multiply' or '×' present -> detect multiplicand/multiplier and product lines
+    - If fractions present -> treat as fraction comparison
+    - Else fallback to returning candidate_text as question and None as answer
+    """
+    text = candidate_text.strip()
+    # normalize whitespace
+    text_norm = re.sub(r'\s+', ' ', text)
+    # 1) Answer:
+    m = re.search(r'answer\s*[:\-]\s*(.+)', text_norm, flags=re.IGNORECASE)
+    if m:
+        q = re.sub(r'answer\s*[:\-].*', '', text_norm, flags=re.IGNORECASE).strip()
+        a = m.group(1).strip()
+        return q, a, "answer_colon"
+    # 2) equals sign
+    if "=" in text_norm:
+        parts = text_norm.split("=")
+        q = parts[0].strip()
+        a = "=".join(parts[1:]).strip()
+        return q, a, "equals"
+    # 3) multiplication layout: look at raw lines to find a pattern like:
+    #    35
+    #   x 4
+    #   140
+    # We'll search for a line containing 'multiply' or '×' or 'x' and then numeric neighbors
+    joined_lines = raw_text_lines
+    for i, ln in enumerate(joined_lines):
+        if re.search(r'\bmultiply\b|×|\bx\b', ln, flags=re.IGNORECASE):
+            # look around for numeric lines
+            nums_before = []
+            nums_after = []
+            # collect up to 3 lines before and after
+            for j in range(max(0, i-3), i):
+                nums_before.extend(re.findall(r'\d+', joined_lines[j]))
+            for j in range(i+1, min(len(joined_lines), i+4)):
+                nums_after.extend(re.findall(r'\d+', joined_lines[j]))
+            all_nums = nums_before + nums_after
+            if len(all_nums) >= 2:
+                # assume first two are multiplicand and multiplier, third (if any) is product
+                q = f"{all_nums[0]} × {all_nums[1]}"
+                a = all_nums[2] if len(all_nums) >= 3 else None
+                return q, a, "multiplication_layout"
+    # 4) fractions
+    fracs = extract_fractions(text_norm)
+    if fracs:
+        # try to find answer fraction in text
+        m2 = re.search(r'answer\s*[:\-]?\s*(\d+\s*/\s*\d+)', text_norm, flags=re.IGNORECASE)
+        a = m2.group(1).strip() if m2 else None
+        q = " ".join(fracs)
+        return q, a, "fractions"
+    # 5) simple arithmetic detection
+    m_ar = re.search(r'(\d+\s*[\+\-]\s*\d+)', text_norm)
+    if m_ar:
+        q = m_ar.group(1).strip()
+        # try to find numeric answer after it
+        m_after = re.search(re.escape(q) + r'.*?=\s*([-\d\.]+)', text_norm)
+        a = m_after.group(1).strip() if m_after else None
+        return q, a, "arithmetic"
+    # fallback
+    return text_norm, None, "unknown"
 
-def clean_lines(text):
-    lines = [ln.strip() for ln in text.splitlines()]
-    cleaned = []
-    for ln in lines:
-        if not ln:
-            continue
-        low = ln.lower()
-        # skip common UI noise
-        if any(skip in low for skip in ["koobits", "student.koobits", "multiplayer", "peer-challenge", "streamlit", "http", "https"]):
-            continue
-        cleaned.append(ln)
-    return cleaned
-
-def pretty_join(lines):
-    return " ".join(lines).strip()
-
-# Explanation helpers
-def explain_addition(num1, num2):
-    tens1, ones1 = divmod(num1, 10)
-    tens2, ones2 = divmod(num2, 10)
-    steps = []
-    steps.append(f"Step 1: Add the ones → {ones1} + {ones2} = {ones1 + ones2}")
-    if ones1 + ones2 >= 10:
-        steps.append("Step 2: Carry 1 to the tens.")
-        carry = 1
-        ones_sum = (ones1 + ones2) % 10
-    else:
-        carry = 0
-        ones_sum = ones1 + ones2
-    steps.append(f"Step 3: Add the tens → {tens1} + {tens2} + carry {carry} = {tens1 + tens2 + carry}")
-    total = (tens1 + tens2 + carry) * 10 + ones_sum
-    steps.append(f"Final Answer: {total}")
-    return steps
-
-def explain_subtraction(num1, num2):
-    tens1, ones1 = divmod(num1, 10)
-    tens2, ones2 = divmod(num2, 10)
-    steps = []
-    if ones1 < ones2:
-        steps.append(f"Step 1: Borrow from tens → {tens1} becomes {tens1-1}, ones become {ones1+10}")
-        ones1 += 10
-        tens1 -= 1
-    steps.append(f"Step 2: Subtract ones → {ones1} - {ones2} = {ones1 - ones2}")
-    steps.append(f"Step 3: Subtract tens → {tens1} - {tens2} = {tens1 - tens2}")
-    total = (tens1 - tens2) * 10 + (ones1 - ones2)
-    steps.append(f"Final Answer: {total}")
-    return steps
-
-def explain_multiplication(num1, num2):
-    steps = []
-    steps.append(f"Step 1: Multiply → {num1} × {num2} = {num1 * num2}")
-    steps.append(f"Final Answer: {num1 * num2}")
-    return steps
+def evaluate_and_explain(question, student_answer):
+    """
+    Return dict: {ok:bool/None, correct_answer:str, explanation:list[str]}
+    """
+    explanation = []
+    try:
+        # fractions
+        if re.search(r'\d+\s*/\s*\d+', question):
+            fracs = extract_fractions(question)
+            frac_objs = [(f, Fraction(int(re.findall(r'\d+', f)[0]), int(re.findall(r'\d+', f)[1]))) for f in fracs]
+            smallest = min(frac_objs, key=lambda x: x[1])
+            correct = smallest[0]
+            explanation.append(f"Fractions compared: {', '.join([f for f,_ in frac_objs])}")
+            explanation.append(f"Smallest is {correct} (value {float(smallest[1]):.3f})")
+            if student_answer:
+                m = re.search(r'(\d+\s*/\s*\d+)', student_answer)
+                if m:
+                    stud = Fraction(*map(int, re.findall(r'\d+', m.group(1))))
+                    ok = (stud == smallest[1])
+                    return {"ok": ok, "correct_answer": correct, "explanation": explanation}
+                else:
+                    # try numeric compare
+                    try:
+                        stud_val = float(student_answer)
+                        ok = abs(stud_val - float(smallest[1])) < 1e-6
+                        return {"ok": ok, "correct_answer": correct, "explanation": explanation}
+                    except:
+                        return {"ok": None, "correct_answer": correct, "explanation": explanation}
+            return {"ok": None, "correct_answer": correct, "explanation": explanation}
+        # multiplication or arithmetic
+        if "×" in question or "x" in question or re.search(r'\d+\s*\*\s*\d+', question):
+            nums = extract_numbers(question)
+            if len(nums) >= 2:
+                correct = nums[0] * nums[1]
+                explanation.append(f"Computed {nums[0]} × {nums[1]} = {correct}")
+                if student_answer and re.search(r'\d+', student_answer):
+                    stud = int(re.search(r'\d+', student_answer).group())
+                    return {"ok": stud == correct, "correct_answer": str(correct), "explanation": explanation}
+                return {"ok": None, "correct_answer": str(correct), "explanation": explanation}
+        if re.search(r'\d+\s*[\+\-]\s*\d+', question):
+            nums = extract_numbers(question)
+            if len(nums) >= 2:
+                if "+" in question:
+                    correct = nums[0] + nums[1]
+                    explanation.append(f"Computed {nums[0]} + {nums[1]} = {correct}")
+                else:
+                    correct = nums[0] - nums[1]
+                    explanation.append(f"Computed {nums[0]} - {nums[1]} = {correct}")
+                if student_answer and re.search(r'-?\d+', student_answer):
+                    stud = int(re.search(r'-?\d+', student_answer).group())
+                    return {"ok": stud == correct, "correct_answer": str(correct), "explanation": explanation}
+                return {"ok": None, "correct_answer": str(correct), "explanation": explanation}
+        # fallback: try sympy
+        try:
+            val = sympify(question).evalf()
+            correct = float(val)
+            explanation.append(f"Sympy evaluated question to {correct}")
+            if student_answer:
+                try:
+                    stud = float(student_answer)
+                    return {"ok": abs(stud - correct) < 1e-6, "correct_answer": str(correct), "explanation": explanation}
+                except:
+                    return {"ok": None, "correct_answer": str(correct), "explanation": explanation}
+            return {"ok": None, "correct_answer": str(correct), "explanation": explanation}
+        except Exception:
+            return {"ok": None, "correct_answer": None, "explanation": ["Could not evaluate automatically."]}
+    except Exception as e:
+        return {"ok": None, "correct_answer": None, "explanation": [f"Error during evaluation: {e}"]}
 
 # -------------------------
 # Streamlit UI
 # -------------------------
-st.set_page_config(page_title="Koobits Screenshot Helper", layout="centered")
-st.title("Koobits Screenshot Helper")
+st.set_page_config(page_title="Robust Koobits Helper", layout="centered")
+st.title("Robust Koobits Screenshot Helper (Copilot style)")
 
-uploaded_file = st.file_uploader("Upload Koobits screenshot", type=["png", "jpg", "jpeg"])
-if not uploaded_file:
-    st.info("Upload a Koobits screenshot and the app will try to detect the question and student answer.")
+uploaded = st.file_uploader("Upload Koobits screenshot", type=["png", "jpg", "jpeg"])
+if not uploaded:
+    st.info("Upload a screenshot. The app will run multiple OCR passes and attempt to parse question and answer.")
+    st.stop()
+
+img = Image.open(uploaded).convert("RGB")
+st.image(img, caption="Uploaded image", use_column_width=True)
+
+# 1) Generate preprocessing variants
+variants = preprocess_variants(img)
+
+# 2) OCR configs to try
+configs = [
+    ("digits_ops", "-c tessedit_char_whitelist=0123456789+-×x*/=/: --psm 6"),
+    ("digits_only", "-c tessedit_char_whitelist=0123456789 -l eng --psm 6"),
+    ("default", "--psm 3")
+]
+
+ocr_results = []
+for vname, vimg in variants:
+    for cname, cfg in configs:
+        text, conf, data = ocr_with_config(vimg, cfg)
+        ocr_results.append({"variant": vname, "config": cname, "text": text, "conf": conf, "data": data})
+
+# 3) Aggregate best candidate
+candidate_text, candidate_conf, sorted_results = aggregate_ocr_results(ocr_results)
+
+st.subheader("OCR candidates (top 5)")
+for r in sorted_results[:5]:
+    st.write(f"- Variant **{r['variant']}** config **{r['config']}** conf **{r['conf']:.1f}** -> {r['text'][:200]}")
+
+st.markdown("---")
+st.write("**Chosen OCR candidate (best)**")
+st.write(candidate_text)
+st.write(f"Confidence score: **{candidate_conf:.1f}**")
+
+# 4) Also show raw lines for layout parsing
+raw_text = "\n".join([r['text'] for r in sorted_results])
+raw_lines = [ln.strip() for ln in raw_text.splitlines() if ln.strip()]
+st.subheader("Filtered OCR lines (for layout detection)")
+st.text_area("Lines", "\n".join(raw_lines), height=180)
+
+# 5) Parse question and answer
+question, student_answer, mode = parse_question_answer(candidate_text, raw_lines)
+st.write("Detected mode:", mode)
+st.write("Parsed question:", question or "None")
+st.write("Parsed student answer:", student_answer or "None")
+
+# 6) Manual overrides
+st.markdown("---")
+st.subheader("Manual overrides")
+q_override = st.text_input("Question (edit if OCR is wrong)", value=question or "")
+a_override = st.text_input("Student answer (edit if OCR is wrong)", value=student_answer or "")
+question = q_override.strip() if q_override.strip() else question
+student_answer = a_override.strip() if a_override.strip() else student_answer
+
+# 7) Evaluate and explain
+st.markdown("---")
+st.subheader("Evaluation")
+result = evaluate_and_explain(question or "", student_answer or "")
+if result["correct_answer"] is not None:
+    st.write("Correct answer:", f"**{result['correct_answer']}**")
+if result["ok"] is True:
+    st.success("✅ Student answer is correct")
+elif result["ok"] is False:
+    st.error("❌ Student answer is incorrect")
 else:
-    img = Image.open(uploaded_file)
-    st.image(img, caption="Uploaded screenshot", use_column_width=True)
+    st.info("⚠️ Could not determine correctness automatically")
 
-    raw_text = pytesseract.image_to_string(img)
-    st.subheader("OCR output (raw)")
-    st.text_area("Raw OCR", raw_text, height=200)
+st.write("Explanation / steps:")
+for line in result["explanation"]:
+    st.write("-", line)
 
-    # Clean OCR and focus on likely math lines
-    lines = clean_lines(raw_text)
-    joined = pretty_join(lines)
-    st.write("Filtered OCR:", joined)
+# 8) Confidence and logs
+st.markdown("---")
+st.subheader("Diagnostics")
+st.write(f"Chosen OCR confidence: **{candidate_conf:.1f}** (0-100 scale)")
+st.write("Top OCR candidates (brief):")
+for r in sorted_results[:6]:
+    txt = r['text'].replace("\n", " ")[:180]
+    st.write(f"- {r['variant']}/{r['config']} conf={r['conf']:.1f} -> {txt}")
 
-    # Parse using multiple strategies
-    question_text = None
-    student_answer_text = None
-    detected_mode = None
-
-    # 1) explicit "Answer:"
-    if re.search(r'answer\s*[:\-]', joined, flags=re.IGNORECASE):
-        parts = re.split(r'answer\s*[:\-]\s*', joined, flags=re.IGNORECASE)
-        question_text = parts[0].strip()
-        student_answer_text = parts[1].strip() if len(parts) > 1 else None
-        detected_mode = "answer_colon"
-
-    # 2) equals sign
-    elif "=" in joined:
-        parts = joined.split("=")
-        question_text = parts[0].strip()
-        student_answer_text = parts[1].strip() if len(parts) > 1 else None
-        detected_mode = "equals"
-
-    # 3) multiplication
-    elif re.search(r'×|multiply|\b\d+\s*x\s*\d+\b', joined, flags=re.IGNORECASE):
-        detected_mode = "multiplication"
-        nums = extract_numbers(joined)
-        if len(nums) >= 2:
-            question_text = f"{nums[0]} × {nums[1]}"
-            # try to find product candidate after multiply line
-            mul_index = None
-            for i, ln in enumerate(lines):
-                if re.search(r'×|multiply|\b\d+\s*x\s*\d+\b', ln, flags=re.IGNORECASE):
-                    mul_index = i
-                    break
-            candidate = None
-            if mul_index is not None:
-                for ln in lines[mul_index+1:]:
-                    n = extract_numbers(ln)
-                    if n:
-                        candidate = str(n[0])
-                        break
-            if not candidate and len(nums) >= 3:
-                candidate = str(nums[2])
-            student_answer_text = candidate
-
-    # 4) fractions
-    elif re.search(r'\d+\s*/\s*\d+', joined):
-        detected_mode = "fractions"
-        fracs = extract_fractions(joined)
-        question_text = " ".join(fracs)
-        m = re.search(r'answer\s*[:\-]?\s*([0-9]+\s*/\s*[0-9]+|\d+)', raw_text, flags=re.IGNORECASE)
-        if m:
-            student_answer_text = m.group(1).strip()
-        else:
-            student_answer_text = None
-
-    # 5) simple arithmetic + or -
-    elif re.search(r'\d+\s*[\+\-]\s*\d+', joined):
-        detected_mode = "arithmetic"
-        m = re.search(r'(\d+\s*[\+\-]\s*\d+)', joined)
-        if m:
-            question_text = m.group(1).strip()
-            if "=" in joined:
-                parts = joined.split("=")
-                if len(parts) > 1:
-                    student_answer_text = parts[1].strip()
-            else:
-                arith_index = None
-                for i, ln in enumerate(lines):
-                    if re.search(r'\d+\s*[\+\-]\s*\d+', ln):
-                        arith_index = i
-                        break
-                if arith_index is not None:
-                    for ln in lines[arith_index+1:]:
-                        n = extract_numbers(ln)
-                        if n:
-                            student_answer_text = str(n[0])
-                            break
-
-    else:
-        detected_mode = "unknown"
-        question_text = joined
-        student_answer_text = None
-
-    st.write("Detected mode:", detected_mode)
-    st.write("Parsed question:", question_text or "None")
-    st.write("Parsed student answer:", student_answer_text or "None")
-
-    # Manual overrides
-    st.markdown("---")
-    st.subheader("Manual overrides (edit if OCR is wrong)")
-    q_override = st.text_input("Question (edit if needed)", value=question_text or "")
-    a_override = st.text_input("Student answer (type if OCR missed it)", value=student_answer_text or "")
-
-    question_text = q_override.strip() if q_override.strip() else question_text
-    student_answer_text = a_override.strip() if a_override.strip() else student_answer_text
-
-    # Final evaluation
-    st.markdown("---")
-    st.subheader("Result")
-
-    if not question_text:
-        st.warning("No question detected. Please type the question in the override box above.")
-    else:
-        try:
-            # Multiplication
-            if detected_mode == "multiplication" or re.search(r'×|\bx\b|\bmultiply\b', question_text, flags=re.IGNORECASE):
-                nums = extract_numbers(question_text)
-                if len(nums) >= 2:
-                    num1, num2 = nums[0], nums[1]
-                    correct = num1 * num2
-                    st.write(f"Computed correct answer: **{correct}**")
-                    if student_answer_text and re.search(r'\d+', student_answer_text):
-                        if int(re.search(r'\d+', student_answer_text).group()) == correct:
-                            st.success("✅ Correct!")
-                        else:
-                            st.error("❌ Wrong")
-                            for s in explain_multiplication(num1, num2):
-                                st.write(s)
-                    else:
-                        st.info("No student answer detected. You can type it in the override box above.")
-                else:
-                    st.warning("Could not extract two numbers for multiplication. Please edit the question manually.")
-
-            # Fractions
-            elif detected_mode == "fractions" or re.search(r'\d+\s*/\s*\d+', question_text):
-                fracs = extract_fractions(question_text)
-                if not fracs:
-                    st.warning("No fractions found to compare. Please edit the question manually.")
-                else:
-                    frac_objs = [(f, parse_fraction(f)) for f in fracs]
-                    smallest = min(frac_objs, key=lambda x: x[1])
-                    st.write("Fractions detected:", ", ".join([f for f, _ in frac_objs]))
-                    st.write(f"Smallest fraction is **{smallest[0]}** (value {float(smallest[1])})")
-                    if student_answer_text:
-                        m_frac = re.search(r'(\d+\s*/\s*\d+)', student_answer_text)
-                        if m_frac:
-                            stud_frac = parse_fraction(m_frac.group(1))
-                            if stud_frac == smallest[1]:
-                                st.success("✅ Correct!")
-                            else:
-                                st.error("❌ Wrong")
-                                st.write(f"Correct answer: {smallest[0]}")
-                        else:
-                            try:
-                                stud_val = float(student_answer_text)
-                                if abs(stud_val - float(smallest[1])) < 1e-6:
-                                    st.success("✅ Correct!")
-                                else:
-                                    st.error("❌ Wrong")
-                                    st.write(f"Correct answer: {smallest[0]}")
-                            except:
-                                st.info("Student answer not recognized as a fraction or number. Please edit it in the override box.")
-                    else:
-                        st.info("No student answer detected. You can type it in the override box above.")
-
-            # Addition / Subtraction
-            elif re.search(r'\d+\s*[\+\-]\s*\d+', question_text):
-                nums = extract_numbers(question_text)
-                if len(nums) >= 2:
-                    if "+" in question_text:
-                        num1, num2 = nums[0], nums[1]
-                        correct = num1 + num2
-                        st.write(f"Computed correct answer: **{correct}**")
-                        if student_answer_text and re.search(r'\d+', student_answer_text):
-                            if int(re.search(r'\d+', student_answer_text).group()) == correct:
-                                st.success("✅ Correct!")
-                            else:
-                                st.error("❌ Wrong")
-                                for s in explain_addition(num1, num2):
-                                    st.write(s)
-                        else:
-                            st.info("No student answer detected. You can type it in the override box above.")
-                    else:
-                        num1, num2 = nums[0], nums[1]
-                        correct = num1 - num2
-                        st.write(f"Computed correct answer: **{correct}**")
-                        if student_answer_text and re.search(r'-?\d+', student_answer_text):
-                            if int(re.search(r'-?\d+', student_answer_text).group()) == correct:
-                                st.success("✅ Correct!")
-                            else:
-                                st.error("❌ Wrong")
-                                for s in explain_subtraction(num1, num2):
-                                    st.write(s)
-                        else:
-                            st.info("No student answer detected. You can type it in the override box above.")
-                else:
-                    st.warning("Could not extract two numbers for arithmetic. Please edit the question manually.")
-
-            # Fallback: try sympy for other expressions
-            else:
-                try:
-                    correct = sympify(question_text).evalf()
-                    st.write(f"Computed correct answer: **{correct}**")
-                    if student_answer_text:
-                        try:
-                            if float(student_answer_text) == float(correct):
-                                st.success("✅ Correct!")
-                            else:
-                                st.error("❌ Wrong")
-                                st.write(f"Correct answer: {correct}")
-                        except:
-                            st.info("Student answer not recognized as a number. Edit the override box.")
-                    else:
-                        st.info("No student answer detected. You can type it in the override box above.")
-                except Exception:
-                    st.info("Could not evaluate the question automatically. Please edit the question to a clear expression or type the correct answer manually.")
-        except Exception as e:
-            st.warning(f"Error while solving: {e}")
+st.info("If OCR is noisy, use the override boxes. For better OCR, try cropping the question area or increasing contrast.")
