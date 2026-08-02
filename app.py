@@ -1,7 +1,13 @@
 import streamlit as st
 from PIL import Image
 import pytesseract
+import re
 from sympy import sympify
+
+# --- Helper to safely extract numbers ---
+def extract_numbers(text):
+    # Find all sequences of digits in the text
+    return [int(n) for n in re.findall(r'\d+', text)]
 
 # --- Explanation helpers ---
 def explain_addition(num1, num2):
@@ -37,7 +43,7 @@ def explain_subtraction(num1, num2):
 
 def explain_multiplication(num1, num2):
     steps = []
-    steps.append(f"Step 1: Multiply ones → {num1} × {num2} = {num1 * num2}")
+    steps.append(f"Step 1: Multiply → {num1} × {num2} = {num1 * num2}")
     steps.append(f"Final Answer: {num1 * num2}")
     return steps
 
@@ -51,31 +57,22 @@ if uploaded_file:
     text = pytesseract.image_to_string(img).strip()
     st.write("OCR Detected:", text)
 
-    # --- Clean OCR lines ---
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    # Only keep lines that look like math or answers
-    math_lines = [line for line in lines if any(ch in line for ch in ["+", "-", "×", "/", "Answer", "="])]
-
     question = None
     student_answer = None
 
-    if not math_lines:
-        st.warning("No math detected in OCR. Please type your question/answer manually.")
+    # --- Flexible parsing ---
+    if "=" in text:
+        parts = text.split("=")
+        question = parts[0].strip()
+        student_answer = parts[1].strip()
+    elif "Answer:" in text:
+        parts = text.split("Answer:")
+        question = parts[0].strip()
+        student_answer = parts[1].strip()
     else:
-        # Try to parse based on patterns
-        joined = " ".join(math_lines)
-        if "=" in joined:
-            parts = joined.split("=")
-            question = parts[0].strip()
-            student_answer = parts[1].strip()
-        elif "Answer:" in joined:
-            parts = joined.split("Answer:")
-            question = parts[0].strip()
-            student_answer = parts[1].strip()
-        else:
-            question = joined.strip()
-            student_answer = None
-            st.warning("OCR did not detect an answer. Please type it below.")
+        question = text.strip()
+        student_answer = None
+        st.warning("OCR did not detect an answer. Please type it below.")
 
     # --- Manual input fallback ---
     if student_answer is None:
@@ -84,9 +81,8 @@ if uploaded_file:
     # --- Answer checking ---
     if question:
         try:
-            if "×" in question:
-                # Multiplication case
-                nums = [int(x) for x in question.replace("×","x").replace("x","*").split() if x.isdigit()]
+            if "×" in question or "x" in question:
+                nums = extract_numbers(question)
                 if len(nums) >= 2:
                     num1, num2 = nums[0], nums[1]
                     correct_answer = num1 * num2
@@ -98,33 +94,40 @@ if uploaded_file:
                         for step in steps:
                             st.write(step)
             elif "+" in question:
-                num1, num2 = map(int, question.split("+"))
-                correct_answer = num1 + num2
-                if student_answer and int(student_answer) == correct_answer:
-                    st.success("✅ Correct!")
-                else:
-                    st.error("❌ Wrong")
-                    steps = explain_addition(num1, num2)
-                    for step in steps:
-                        st.write(step)
+                nums = extract_numbers(question)
+                if len(nums) >= 2:
+                    num1, num2 = nums[0], nums[1]
+                    correct_answer = num1 + num2
+                    if student_answer and student_answer.isdigit() and int(student_answer) == correct_answer:
+                        st.success("✅ Correct!")
+                    else:
+                        st.error("❌ Wrong")
+                        steps = explain_addition(num1, num2)
+                        for step in steps:
+                            st.write(step)
             elif "-" in question:
-                num1, num2 = map(int, question.split("-"))
-                correct_answer = num1 - num2
-                if student_answer and int(student_answer) == correct_answer:
-                    st.success("✅ Correct!")
-                else:
-                    st.error("❌ Wrong")
-                    steps = explain_subtraction(num1, num2)
-                    for step in steps:
-                        st.write(step)
+                nums = extract_numbers(question)
+                if len(nums) >= 2:
+                    num1, num2 = nums[0], nums[1]
+                    correct_answer = num1 - num2
+                    if student_answer and student_answer.isdigit() and int(student_answer) == correct_answer:
+                        st.success("✅ Correct!")
+                    else:
+                        st.error("❌ Wrong")
+                        steps = explain_subtraction(num1, num2)
+                        for step in steps:
+                            st.write(step)
             else:
                 # Fallback to sympy for fractions or other math
                 correct_answer = sympify(question).evalf()
                 if student_answer:
-                    if float(student_answer) == float(correct_answer):
-                        st.success("✅ Correct!")
-                    else:
-                        st.error("❌ Wrong")
+                    try:
+                        if float(student_answer) == float(correct_answer):
+                            st.success("✅ Correct!")
+                        else:
+                            st.error("❌ Wrong")
+                            st.write(f"Correct answer is {correct_answer}, your answer was {student_answer}.")
+                    except:
                         st.write(f"Correct answer is {correct_answer}, your answer was {student_answer}.")
                 else:
                     st.info(f"OCR detected only the question: {question}. Correct answer is {correct_answer}.")
