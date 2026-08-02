@@ -1,5 +1,8 @@
-opencv-python-headless
-streamlit
+fastapi
+uvicorn[standard]
 pillow
 pytesseract
-sympy
+requests
+python-multipart
+fractions
+
